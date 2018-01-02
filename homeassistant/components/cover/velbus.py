@@ -19,15 +19,19 @@ import homeassistant.helpers.config_validation as cv
 
 _LOGGER = logging.getLogger(__name__)
 
-COVER_SCHEMA = vol.Schema({
-    vol.Required('module'): cv.positive_int,
-    vol.Required('open_channel'): cv.positive_int,
-    vol.Required('close_channel'): cv.positive_int,
-    vol.Required(CONF_NAME): cv.string
-})
+CONF_CHANNEL = 'channel'
+CONF_MODULE = 'module'
+CONF_VMB1BL = 'is_VMB1BL'
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
-    vol.Required(CONF_COVERS): vol.Schema({cv.slug: COVER_SCHEMA}),
+    vol.Required(CONF_COVERS): vol.All(cv.ensure_list, [
+        {
+            vol.Required(CONF_NAME): cv.string,
+            vol.Required(CONF_CHANNEL): cv.positive_int,
+            vol.Required(CONF_MODULE): cv.positive_int,
+            vol.Optional('is_VMB1BL', default = False): cv.boolean
+        }
+    ])
 })
 
 DEPENDENCIES = ['velbus']
@@ -35,20 +39,14 @@ DEPENDENCIES = ['velbus']
 
 def setup_platform(hass, config, add_devices, discovery_info=None):
     """Set up cover controlled by Velbus."""
-    devices = config.get(CONF_COVERS, {})
-    covers = []
-
     velbus = hass.data[DOMAIN]
-    for device_name, device_config in devices.items():
-        covers.append(
-            VelbusCover(
-                velbus,
-                device_config.get(CONF_NAME, device_name),
-                device_config.get('module'),
-                device_config.get('open_channel'),
-                device_config.get('close_channel')
-            )
-        )
+    covers = []
+    covers_conf = config.get(CONF_COVERS)
+
+
+    for cover in covers_conf:
+        covers.append(VelbusCover(
+        velbus, cover[CONF_NAME], cover[CONF_MODULE], cover[CONF_CHANNEL]))
 
     if not covers:
         _LOGGER.error("No covers added")
@@ -60,15 +58,14 @@ def setup_platform(hass, config, add_devices, discovery_info=None):
 class VelbusCover(CoverDevice):
     """Representation a Velbus cover."""
 
-    def __init__(self, velbus, name, module, open_channel, close_channel):
+    def __init__(self, velbus, name, module, channel):
         """Initialize the cover."""
         self._velbus = velbus
         self._name = name
-        self._close_channel_state = None
-        self._open_channel_state = None
+        self._channel_state = True
         self._module = module
-        self._open_channel = open_channel
-        self._close_channel = close_channel
+        self._channel = channel
+        self.logger = logging.getLogger('velbus')
 
     @asyncio.coroutine
     def async_added_to_hass(self):
@@ -82,19 +79,20 @@ class VelbusCover(CoverDevice):
 
     def _on_message(self, message):
         import velbus
-        if isinstance(message, velbus.RelayStatusMessage):
+        if isinstance(message, velbus.BlindStatusMessage):
             if message.address == self._module:
-                if message.channel == self._close_channel:
-                    self._close_channel_state = message.is_on()
-                    self.schedule_update_ha_state()
-                if message.channel == self._open_channel:
-                    self._open_channel_state = message.is_on()
-                    self.schedule_update_ha_state()
+                if message.channel == self._channel:
+                    if message.blind_position == 0:
+                        self._channel_state = message.is_up()
+                        self.schedule_update_ha_state()
+                    if message.blind_position == 100:
+                        self._channel_state = message.is_down()
+                        self.schedule_update_ha_state()
 
     @property
     def supported_features(self):
         """Flag supported features."""
-        return SUPPORT_OPEN | SUPPORT_CLOSE | SUPPORT_STOP
+        return SUPPORT_OPEN | SUPPORT_CLOSE
 
     @property
     def should_poll(self):
@@ -109,7 +107,7 @@ class VelbusCover(CoverDevice):
     @property
     def is_closed(self):
         """Return if the cover is closed."""
-        return self._close_channel_state
+        return self._channel_state
 
     @property
     def current_cover_position(self):
@@ -119,42 +117,36 @@ class VelbusCover(CoverDevice):
         """
         return None
 
-    def _relay_off(self, channel):
+    def _blind_down(self, channel):
         import velbus
-        message = velbus.SwitchRelayOffMessage()
+        message = velbus.CoverDownMessage()
         message.set_defaults(self._module)
-        message.relay_channels = [channel]
+        message.channel = channel
         self._velbus.send(message)
 
-    def _relay_on(self, channel):
+    def _blind_up(self, channel):
         import velbus
-        message = velbus.SwitchRelayOnMessage()
+        message = velbus.CoverUpMessage()
         message.set_defaults(self._module)
-        message.relay_channels = [channel]
+        message.channel = channel
         self._velbus.send(message)
 
     def open_cover(self, **kwargs):
         """Open the cover."""
-        self._relay_off(self._close_channel)
-        time.sleep(0.3)
-        self._relay_on(self._open_channel)
+        self._blind_up(self._channel)
 
     def close_cover(self, **kwargs):
         """Close the cover."""
-        self._relay_off(self._open_channel)
-        time.sleep(0.3)
-        self._relay_on(self._close_channel)
+        self._blind_down(self._channel)
 
     def stop_cover(self, **kwargs):
         """Stop the cover."""
-        self._relay_off(self._open_channel)
-        time.sleep(0.3)
-        self._relay_off(self._close_channel)
+        raise NotImplementedError()
 
     def get_status(self):
         """Retrieve current status."""
         import velbus
         message = velbus.ModuleStatusRequestMessage()
         message.set_defaults(self._module)
-        message.channels = [self._open_channel, self._close_channel]
+        message.channels = [self._channel]
         self._velbus.send(message)
